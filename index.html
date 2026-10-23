@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ Neon Kinetic — 60FPS GPGPU Particle System</title>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+
+    <!-- Import Maps -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui-container" class="glass-panel">
+        <div class="header">
+            <h1>⚡ Neon Kinetic</h1>
+            <div class="live-badge">LIVE</div>
+        </div>
+        
+        <div class="stats">
+            <div>
+                <div class="stat-label">Frame Rate</div>
+                <div id="fps-counter" class="stat-value">0 fps</div>
+            </div>
+            <div>
+                <div class="stat-label">Particles</div>
+                <div id="particle-counter" class="stat-value">65k</div>
+            </div>
+        </div>
+
+        <div class="status-msg" id="status-message">
+            Loading AI model...
+        </div>
+
+        <div class="legend">
+            <div class="legend-item"><span>☝</span> 1 Finger → Repel</div>
+            <div class="legend-item"><span>✌</span> 2 Fingers → Star</div>
+            <div class="legend-item"><span>🤟</span> 3 Fingers → Sphere</div>
+            <div class="legend-item"><span>🖖</span> 4 Fingers → Galaxy</div>
+            <div class="legend-item"><span>🖐</span> Palm → Interrupt</div>
+            <div class="legend-item"><span>✊</span> Fist → DNA Helix</div>
+        </div>
+
+        <div class="shape-selection">
+            <button class="shape-btn" onclick="setTargetShape(0)">Sphere</button>
+            <button class="shape-btn" onclick="setTargetShape(1)">Star</button>
+            <button class="shape-btn" onclick="setTargetShape(2)">Galaxy</button>
+            <button class="shape-btn active" onclick="setTargetShape(3)">DNA</button>
+        </div>
+    </div>
+
+    <!-- MediaPipe Vision CDN -->
+    <script type="module">
+        import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8";
+        
+        // Expose to window so Three.js module can grab it
+        window.MediaPipeVision = { HandLandmarker, FilesetResolver };
+    </script>
+
+    <div id="pip-container">
+        <video id="webcam-video" autoplay playsinline muted></video>
+        <canvas id="mediapipe-canvas"></canvas>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+        // ─────────────────────────────────────────────
+        // 1. GPGPU SHADERS
+        // ─────────────────────────────────────────────
+        const SIM_POSITION_SHADER = `
+            uniform float uDelta;
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 pos = texture2D(texturePosition, uv).xyz;
+                vec3 vel = texture2D(textureVelocity, uv).xyz;
+                pos += vel * uDelta;
+                gl_FragColor = vec4(pos, 1.0);
+            }
+        `;
+
+        const SIM_VELOCITY_SHADER = `
+            uniform float uTime;
+            uniform float uDelta;
+            uniform vec3 uAttractor;
+            uniform vec3 uAttractor2;
+            uniform float uTargetShape; // 0:Sphere, 1:Star, 2:Galaxy, 3:Heart
+            uniform float uFingers;     // Count of fingers hand 1
+            uniform float uFingers2;    // Count of fingers hand 2
+            
+            // Texture buffers for target shapes
+            uniform sampler2D tSphere;
+            uniform sampler2D tStar;
+            uniform sampler2D tGalaxy;
+            uniform sampler2D tHeart;
+
+            float hash(vec3 p) {
+                p = fract(p * 0.3183099 + .1);
+                p *= 17.0;
+                return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+            }
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 pos = texture2D(texturePosition, uv).xyz;
+                vec3 vel = texture2D(textureVelocity, uv).xyz;
+                
+                vec3 posSphere = texture2D(tSphere, uv).xyz;
+                vec3 posStar   = texture2D(tStar, uv).xyz;
+                vec3 posGalaxy = texture2D(tGalaxy, uv).xyz;
+                vec3 posHeart  = texture2D(tHeart, uv).xyz;
+                
+                // Smoothly blend between shapes based on uTargetShape
+                float tSph  = clamp(1.0 - abs(uTargetShape - 0.0), 0.0, 1.0);
+                float tStar = clamp(1.0 - abs(uTargetShape - 1.0), 0.0, 1.0);
+                float tGal  = clamp(1.0 - abs(uTargetShape - 2.0), 0.0, 1.0);
+                float tHrt  = clamp(1.0 - abs(uTargetShape - 3.0), 0.0, 1.0);
+                
+                vec3 target = posSphere;
+                float totalW = tSph + tStar + tGal + tHrt;
+                if(totalW > 0.0) {
+                    target = (posSphere * tSph + posStar * tStar + posGalaxy * tGal + posHeart * tHrt) / totalW;
+                }
+
+                float mass = 1.0 + hash(pos) * 2.0;
+
+                vec3 force = vec3(0.0);
+                float friction = 0.92;
+
+                // Noise drift
+                vec3 noise = vec3(
+                    sin(pos.y * 2.0 + uTime),
+                    cos(pos.x * 2.0 + uTime),
+                    sin(pos.z * 2.0 + uTime)
+                ) * 0.3;
+
+                // Hand 1 Logic
+                if (uFingers >= 0.0) { 
+                    vec3 dir = uAttractor - pos;
+                    float dist = length(dir);
+                    if (uFingers == 1.0) {
+                        force += normalize(-dir) * 25.0 / (dist + 0.1);
+                        friction = 0.85;
+                    } else if (uFingers == 5.0) {
+                        force += normalize(-dir) * 40.0 / (dist + 0.2);
+                        friction = 0.80;
+                    } else {
+                        vec3 shapeDir = target - pos;
+                        force += shapeDir * 1.5;
+                    }
+                }
+
+                // Hand 2 Logic
+                if (uFingers2 >= 0.0) { 
+                    vec3 dir = uAttractor2 - pos;
+                    float dist = length(dir);
+                    if (uFingers2 == 1.0) {
+                        force += normalize(-dir) * 25.0 / (dist + 0.1);
+                        friction *= 0.85;
+                    } else if (uFingers2 == 5.0) {
+                        force += normalize(-dir) * 40.0 / (dist + 0.2);
+                        friction *= 0.80;
+                    } else {
+                        vec3 shapeDir = target - pos;
+                        force += shapeDir * 1.5;
+                    }
+                }
+
+                // Idle/General Attraction to Target
+                vec3 finalTargetDir = target - pos;
+                force += finalTargetDir * 2.0;
+                force += noise * (length(finalTargetDir) * 0.2 + 0.5);
+                
+                vec3 acc = force / mass;
+                vel += acc * uDelta;
+                vel *= friction;
+
+                // Max speed
+                if(length(vel) > 15.0) vel = normalize(vel) * 15.0;
+
+                gl_FragColor = vec4(vel, 1.0);
+            }
+        `;
+
+        const PARTICLE_VERTEX = `
+            uniform sampler2D tPosition;
+            uniform sampler2D tVelocity;
+            attribute vec2 reference;
+            
+            varying vec3 vVel;
+            varying vec2 vUv;
+            varying float vVis;
+            varying vec3 vViewVel;
+            
+            void main() {
+                vec4 pos = texture2D(tPosition, reference);
+                vec4 vel = texture2D(tVelocity, reference);
+                vViewVel = (modelViewMatrix * vec4(vel.xyz, 0.0)).xyz;
+                vVis = 1.0;
+
+                vec4 mvPos = modelViewMatrix * vec4(pos.xyz, 1.0);
+                gl_Position = projectionMatrix * mvPos;
+                
+                // Scale size by velocity for vector feel
+                gl_PointSize = (1.5 + length(vVel) * 0.3) * (80.0 / -mvPos.z);
+            }
+        `;
+
+        const PARTICLE_FRAGMENT = `
+            varying vec3 vVel;
+            varying float vVis;
+            varying vec2 vUv;
+            varying vec3 vViewVel;
+
+            void main() {
+                if (vVis < 0.5) discard;
+                
+                // Vector Effect: Stretch coordinate based on motion
+                vec2 pc = gl_PointCoord - vec2(0.5);
+                
+                // Align streak with velocity
+                vec2 velDir = normalize(vViewVel.xy + 0.001);
+                float alignment = abs(dot(pc, velDir));
+                float perpendicular = length(pc - velDir * dot(pc, velDir));
+                
+                // Draw a sharp line-streak (Vector style)
+                float streak = smoothstep(0.1, 0.0, perpendicular) * smoothstep(0.5, 0.3, length(pc));
+                if (streak < 0.1) discard;
+
+                // Darker colors with less additive spike
+                vec3 colBlue = vec3(0.1, 0.5, 1.0);
+                vec3 colPurple = vec3(0.8, 0.1, 0.9);
+                float rnd = fract(sin(dot(vUv, vec2(12.9898, 78.233))) * 43758.5453);
+                vec3 col = mix(colBlue, colPurple, step(0.5, rnd));
+
+                col += vec3(0.2) * length(vVel) * 0.1;
+                gl_FragColor = vec4(col, streak * 0.8);
+            }
+        `;
+
+        // ─────────────────────────────────────────────
+        // 2. STATE MANAGER
+        // ─────────────────────────────────────────────
+        const state = {
+            hands: [
+                { attractor: new THREE.Vector3(), fingers: -1 },
+                { attractor: new THREE.Vector3(), fingers: -1 }
+            ],
+            targetShape: 3.0 // Default to Heart
+        };
+
+        // Expose to window for UI buttons
+        window.setTargetShape = (val) => {
+            state.targetShape = val;
+            document.querySelectorAll('.shape-btn').forEach((btn, i) => {
+                btn.classList.toggle('active', i === val);
+            });
+        };
+
+        const domStatus = document.getElementById('status-message');
+        const domFPS    = document.getElementById('fps-counter');
+
+        function setStatus(msg) {
+            domStatus.innerText = msg;
+        }
+
+        // ─────────────────────────────────────────────
+        // 3. THREE.JS ENGINE SETUP
+        // ─────────────────────────────────────────────
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x020108);
+
+        const camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(new RenderPass(scene, camera));
+        
+        // MEDIUM INTENSITY BLOOM (User preference)
+        const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.6, 0.4, 0.85); 
+        composer.addPass(bloom);
+
+        // Particle System Setup
+        const WIDTH = 256; 
+        const PARTICLES = WIDTH * WIDTH; // 65,536 particles
+        
+        const gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
+        const dtPos = gpuCompute.createTexture();
+        const dtVel = gpuCompute.createTexture();
+        const dtSphere = gpuCompute.createTexture();
+        const dtStar = gpuCompute.createTexture();
+        const dtGalaxy = gpuCompute.createTexture();
+        const dtHeart = gpuCompute.createTexture();
+        
+        // Mathematical shape generators
+        const pArr = dtPos.image.data;
+        const sphArr = dtSphere.image.data;
+        const strArr = dtStar.image.data;
+        const glxArr = dtGalaxy.image.data;
+        const hrtArr = dtHeart.image.data;
+
+        for (let i = 0; i < PARTICLES; i++) {
+            const k = i * 4;
+
+            // ── Sphere
+            const phi = Math.acos(-1 + (2 * i) / PARTICLES);
+            const theta = Math.sqrt(PARTICLES * Math.PI) * phi;
+            const rSph = 6.0 + (Math.random() - 0.5)*0.5;
+            sphArr[k+0] = rSph * Math.cos(theta) * Math.sin(phi);
+            sphArr[k+1] = rSph * Math.sin(theta) * Math.sin(phi);
+            sphArr[k+2] = rSph * Math.cos(phi);
+            sphArr[k+3] = 1;
+
+            // ── Star (3D 5-pointed spike burst)
+            const stAng1 = Math.random() * Math.PI * 2;
+            const stAng2 = Math.random() * Math.PI * 2;
+            const points = 5.0;
+            const rStar = 4.0 + 8.0 * Math.pow(Math.abs(Math.sin((stAng1 * points)/2.0)), 4.0);
+            strArr[k+0] = rStar * Math.cos(stAng1) * Math.cos(stAng2);
+            strArr[k+1] = rStar * Math.sin(stAng1) * Math.cos(stAng2);
+            strArr[k+2] = (rStar*0.3) * Math.sin(stAng2); 
+            strArr[k+3] = 1;
+
+            // ── Galaxy (Spiral with thickness)
+            const arms = 3;
+            const arm = Math.floor(Math.random() * arms);
+            const rGal = Math.pow(Math.random(), 0.5) * 14.0;
+            const spread = (Math.random() - 0.5) * 1.5 * (rGal / 14.0);
+            const gAngle = (arm / arms) * Math.PI * 2 + rGal * 0.4 + spread * 0.2;
+            glxArr[k+0] = Math.cos(gAngle) * rGal + (Math.random()-0.5)*spread;
+            glxArr[k+1] = (Math.random() - 0.5) * 1.5 * Math.exp(-rGal * 0.1);
+            glxArr[k+2] = Math.sin(gAngle) * rGal + (Math.random()-0.5)*spread;
+            glxArr[k+3] = 1;
+
+            // ── DNA Helix (Smooth Double Helix)
+            const tParam = Math.random() * Math.PI * 4.0; // 2 turns
+            const side = Math.random() > 0.5 ? 1.0 : -1.0;
+            const helixRadius = 5.0;
+            const helixHeight = 16.0;
+            const phase = (side === 1.0) ? 0.0 : Math.PI;
+
+            hrtArr[k+0] = Math.cos(tParam + phase) * helixRadius;
+            hrtArr[k+1] = (tParam / (Math.PI * 4.0) - 0.5) * helixHeight;
+            hrtArr[k+2] = Math.sin(tParam + phase) * helixRadius;
+            hrtArr[k+3] = 1;
+
+            // Start off as Heart
+            pArr[k+0]=hrtArr[k+0]; pArr[k+1]=hrtArr[k+1]; pArr[k+2]=hrtArr[k+2]; pArr[k+3]=1;
+        }
+
+        const velVar = gpuCompute.addVariable("textureVelocity", SIM_VELOCITY_SHADER, dtVel);
+        const posVar = gpuCompute.addVariable("texturePosition", SIM_POSITION_SHADER, dtPos);
+        gpuCompute.setVariableDependencies(velVar, [posVar, velVar]);
+        gpuCompute.setVariableDependencies(posVar, [posVar, velVar]);
+
+        velVar.material.uniforms["uTime"] = { value: 0 };
+        velVar.material.uniforms["uDelta"] = { value: 0 };
+        velVar.material.uniforms["uAttractor"] = { value: new THREE.Vector3() };
+        velVar.material.uniforms["uAttractor2"] = { value: new THREE.Vector3() };
+        velVar.material.uniforms["uTargetShape"] = { value: 3.0 }; 
+        velVar.material.uniforms["uFingers"] = { value: -1 }; 
+        velVar.material.uniforms["uFingers2"] = { value: -1 }; 
+        velVar.material.uniforms["tSphere"] = { value: dtSphere };
+        velVar.material.uniforms["tStar"] = { value: dtStar };
+        velVar.material.uniforms["tGalaxy"] = { value: dtGalaxy };
+        velVar.material.uniforms["tHeart"] = { value: dtHeart };
+
+        posVar.material.uniforms["uDelta"] = { value: 0 };
+
+        gpuCompute.init();
+
+        const geo = new THREE.BufferGeometry();
+        const refs = new Float32Array(PARTICLES * 2);
+        const positions = new Float32Array(PARTICLES * 3); // Dummy positions
+        for(let i=0; i<PARTICLES; i++){
+            refs[i*2] = (i%WIDTH)/WIDTH;
+            refs[i*2+1] = Math.floor(i/WIDTH)/WIDTH;
+            positions[i*3] = 0; positions[i*3+1] = 0; positions[i*3+2] = 0;
+        }
+        geo.setAttribute('reference', new THREE.BufferAttribute(refs, 2));
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        const mat = new THREE.ShaderMaterial({
+            uniforms: {
+                tPosition: { value: null },
+                tVelocity: { value: null },
+                uActive: { value: PARTICLES },
+                uTotal: { value: PARTICLES }
+            },
+            vertexShader: PARTICLE_VERTEX,
+            fragmentShader: PARTICLE_FRAGMENT,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particlesMesh = new THREE.Points(geo, mat);
+        particlesMesh.frustumCulled = false;
+        scene.add(particlesMesh);
+
+        // ─────────────────────────────────────────────
+        // 4. MEDIAPIPE HAND TRACKING
+        // ─────────────────────────────────────────────
+        let handLandmarker = null;
+        let lastVideoTime = -1;
+        const video = document.getElementById('webcam-video');
+        const canvas = document.getElementById('mediapipe-canvas');
+        const ctx = canvas.getContext('2d');
+
+        async function initMediaPipe() {
+            try {
+                setStatus("Initializing AI Vision...");
+                if (!window.MediaPipeVision) {
+                    console.log("Waiting for MediaPipe library...");
+                    setTimeout(initMediaPipe, 200);
+                    return;
+                }
+                
+                console.log("Loading HandLandmarker model...");
+                const vision = await window.MediaPipeVision.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm");
+                handLandmarker = await window.MediaPipeVision.HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numHands: 2
+                });
+                console.log("MediaPipe Model Loaded.");
+
+                setStatus("Requesting Camera...");
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+                    video.srcObject = stream;
+                    video.addEventListener("loadeddata", () => {
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        setStatus("Ready: Gestures Online");
+                    });
+                } catch (camErr) {
+                    console.error("Camera Access Denied/Blocked:", camErr);
+                    setStatus("Camera BLOCKED: Close other apps (Zoom/Teams) & allow permissions.");
+                }
+
+            } catch(e) {
+                console.error("Model Load Error:", e);
+                setStatus("Model LOAD FAILED: Check internet connection or browser firewall.");
+            }
+        }
+        initMediaPipe();
+
+        // ─────────────────────────────────────────────
+        // 5. MAIN LOOP
+        // ─────────────────────────────────────────────
+        const clock = new THREE.Clock();
+        let frameCount = 0;
+        let lastFpsTime = performance.now();
+
+        function detectFingers(landmarks) {
+            // Very simple angle/distance check for extended fingers
+            // Tips: 4(thumb), 8(index), 12(mid), 16(ring), 20(pinky)
+            const tips = [8, 12, 16, 20];
+            const pips = [6, 10, 14, 18];
+            const wrist = landmarks[0];
+
+            let count = 0;
+            // Check index to pinky
+            for (let i = 0; i < 4; i++) {
+                const tip = landmarks[tips[i]];
+                const pip = landmarks[pips[i]];
+                
+                // If tip is further from wrist than PIP joint, it's extended
+                const distTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+                const distPip = Math.hypot(pip.x - wrist.x, pip.y - wrist.y);
+                if (distTip > distPip + 0.05) { 
+                    count++;
+                }
+            }
+            
+            // Check thumb approx
+            const thumbTip = landmarks[4];
+            const thumbBase = landmarks[2];
+            const tDistTip = Math.hypot(thumbTip.x - wrist.x, thumbTip.y - wrist.y);
+            const tDistBase = Math.hypot(thumbBase.x - wrist.x, thumbBase.y - wrist.y);
+            if (tDistTip > tDistBase + 0.05) count++;
+
+            return count;
+        }
+
+        let detectFrameSkip = 0;
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Calculate DT safely
+            const dt = Math.min(clock.getDelta(), 0.03);
+
+            // Handle MediaPipe tracking (Throttled for performance)
+            if (handLandmarker && video.readyState >= 2) {
+                if (video.currentTime !== lastVideoTime && detectFrameSkip <= 0) {
+                    lastVideoTime = video.currentTime;
+                    detectFrameSkip = 2; // Run detection every 3rd frame
+                    
+                    const results = handLandmarker.detectForVideo(video, performance.now());
+                    
+                    ctx.clearRect(0,0, canvas.width, canvas.height);
+                    
+                    // Reset State
+                    state.hands[0].fingers = -1;
+                    state.hands[1].fingers = -1;
+
+                    if (results.landmarks.length > 0) {
+                        results.landmarks.forEach((lm, index) => {
+                            if (index >= 2) return; // Cap at 2 hands
+
+                            // ID based on hand index
+                            const hCount = detectFingers(lm);
+                            state.hands[index].fingers = hCount;
+
+                            // Attractor
+                            const ix = (1.0 - lm[8].x) * 2.0 - 1.0;
+                            const iy = -(lm[8].y * 2.0 - 1.0);
+                            const vec = new THREE.Vector3(ix, iy, 0.5);
+                            vec.unproject(camera);
+                            const dir = vec.sub(camera.position).normalize();
+                            const dist = (0 - camera.position.z) / dir.z;
+                            state.hands[index].attractor.copy(camera.position).add(dir.multiplyScalar(dist));
+
+                            // Global shape change based on any hand's gesture
+                            if (hCount === 0) state.targetShape = 3.0; // Heart
+                            else if (hCount === 2) state.targetShape = 1.0; // Star
+                            else if (hCount === 3) state.targetShape = 0.0; // Sphere
+                            else if (hCount === 4) state.targetShape = 2.0; // Galaxy
+
+                            // Render Skeleton
+                            const color = 'rgba(0, 120, 255, 1.0)'; // Bright Blue
+                            ctx.strokeStyle = color;
+                            ctx.lineWidth = 4.0;
+                            
+                            for (let line of [[0,1,2,3,4], [0,5,6,7,8], [5,9,10,11,12], [9,13,14,15,16], [13,17,18,19,20], [0,17]]) {
+                                ctx.beginPath();
+                                for (let i=0; i<line.length; i++) {
+                                    const pt = lm[line[i]];
+                                    const px = (1.0 - pt.x) * canvas.width;
+                                    const py = pt.y * canvas.height;
+                                    if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+                                }
+                                ctx.stroke();
+                            }
+
+                            // Glowing joints
+                            const tips = [4, 8, 12, 16, 20];
+                            for (let i = 0; i < lm.length; i++) {
+                                const pt = lm[i];
+                                const px = (1.0 - pt.x) * canvas.width;
+                                const py = pt.y * canvas.height;
+                                const isTip = tips.includes(i);
+                                
+                                ctx.beginPath();
+                                ctx.arc(px, py, isTip ? 4.5 : 2.5, 0, 2 * Math.PI);
+                                ctx.fillStyle = isTip ? '#ff00ff' : '#ffffff'; // Pink tips
+                                ctx.fill();
+                                
+                                if (isTip) {
+                                    ctx.shadowBlur = 10;
+                                    ctx.shadowColor = '#ff00ff';
+                                    ctx.stroke();
+                                    ctx.shadowBlur = 0;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Sync GLSL
+            velVar.material.uniforms.uTime.value += dt;
+            velVar.material.uniforms.uDelta.value = dt;
+            posVar.material.uniforms.uDelta.value = dt;
+            
+            const tsUniform = velVar.material.uniforms.uTargetShape;
+            tsUniform.value += (state.targetShape - tsUniform.value) * dt * 2.0;
+            
+            velVar.material.uniforms.uAttractor.value.copy(state.hands[0].attractor);
+            velVar.material.uniforms.uFingers.value = state.hands[0].fingers;
+            velVar.material.uniforms.uAttractor2.value.copy(state.hands[1].attractor);
+            velVar.material.uniforms.uFingers2.value = state.hands[1].fingers;
+
+            // Auto rotate continually
+            particlesMesh.rotation.y += 0.15 * dt;
+            particlesMesh.rotation.x += (0 - particlesMesh.rotation.x) * dt;
+
+            gpuCompute.compute();
+
+            // Update particles
+            mat.uniforms.tPosition.value = gpuCompute.getCurrentRenderTarget(posVar).texture;
+            mat.uniforms.tVelocity.value = gpuCompute.getCurrentRenderTarget(velVar).texture;
+            mat.uniforms.uActive.value = state.activeParticles || PARTICLES;
+            mat.uniforms.uTotal.value = PARTICLES;
+
+            // Debug access
+            window.scene = scene;
+            window.mat = mat;
+            window.gpuCompute = gpuCompute;
+            mat.uniforms.uActive.value = state.activeParticles || PARTICLES;
+            mat.uniforms.uTotal.value = PARTICLES;
+
+            composer.render();
+
+            // FPS Update
+            frameCount++;
+            const now = performance.now();
+            if (now - lastFpsTime >= 500) {
+                domFPS.innerText = Math.round((frameCount*1000)/(now - lastFpsTime)) + ' fps';
+                frameCount = 0;
+                lastFpsTime = now;
+            }
+            detectFrameSkip--;
+        }
+        animate();
+        console.log("⚡ Neon Kinetic: Particle Engine Initialized.");
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
